@@ -1,0 +1,11 @@
+region                  = "eu-west-2"
+name_prefix             = "northstar-demo"
+foundation_state_bucket = "replace-me-terraform-state"
+foundation_lock_table   = "replace-me-terraform-locks"
+
+tags = {
+  Application = "flight-management"
+  Environment = "dev"
+  Owner       = "replace-me"
+  Project     = "northstar-demo"
+}

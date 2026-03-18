@@ -1,0 +1,99 @@
+name: flight-management-terraform
+
+on:
+  pull_request:
+    paths:
+      - "environments/dev/**"
+      - ".github/workflows/terraform.yml"
+      - "demo-app/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "environments/dev/**"
+      - ".github/workflows/terraform.yml"
+      - "demo-app/**"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: environments/dev
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+      FOUNDATION_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      FOUNDATION_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: >
+          terraform init
+          -backend-config="bucket=${TF_STATE_BUCKET}"
+          -backend-config="key=flight/dev/terraform.tfstate"
+          -backend-config="region=${AWS_REGION}"
+          -backend-config="dynamodb_table=${TF_LOCK_TABLE}"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: >
+          terraform plan
+          -var="region=${AWS_REGION}"
+          -var="foundation_state_bucket=${FOUNDATION_STATE_BUCKET}"
+          -var="foundation_lock_table=${FOUNDATION_LOCK_TABLE}"
+          -out=tfplan
+
+      - name: Terraform apply bootstrap
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture ECR repository URL
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: ecr
+        run: echo "repository_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push demo image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: demo-app
+        env:
+          REPOSITORY_URL: ${{ steps.ecr.outputs.repository_url }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "${REPOSITORY_URL}:${IMAGE_TAG}" .
+          docker push "${REPOSITORY_URL}:${IMAGE_TAG}"
+
+      - name: Terraform apply final image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: >
+          terraform apply -auto-approve
+          -var="region=${AWS_REGION}"
+          -var="foundation_state_bucket=${FOUNDATION_STATE_BUCKET}"
+          -var="foundation_lock_table=${FOUNDATION_LOCK_TABLE}"
+          -var="container_image=${{ steps.ecr.outputs.repository_url }}:${{ github.sha }}"
