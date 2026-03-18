@@ -14,48 +14,79 @@ on:
       - ".github/workflows/terraform.yml"
       - "demo-app/**"
 
-permissions:
-  contents: read
-
 env:
   APP_NAME: flight-management
   DEPLOY_ENV: dev
+  NAME_PREFIX: northstar-demo
+  HEALTH_PATH: /flight/health
   TF_WORKING_DIR: environments/dev
+  TF_STATE_KEY: flight/dev/terraform.tfstate
+  FOUNDATION_STATE_KEY: foundation/dev/terraform.tfstate
 
 jobs:
-  terraform:
+  pre-checks:
+    name: Pre-checks
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: environments/dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Allow Terraform module checkout from GitHub
+        run: git config --global url."https://x-access-token:${{ secrets.GH_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init without backend
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+  terraform-bootstrap:
+    name: Terraform Bootstrap
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: pre-checks
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     defaults:
       run:
         working-directory: environments/dev
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
       FOUNDATION_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       FOUNDATION_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
-      TF_STATE_KEY: flight/dev/terraform.tfstate
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Allow Terraform module checkout from GitHub
         run: git config --global url."https://x-access-token:${{ secrets.GH_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: github-actions-flight-bootstrap
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform fmt
-        run: terraform fmt -check -recursive
+        uses: hashicorp/setup-terraform@v4
 
       - name: Terraform init
         run: >
@@ -75,19 +106,39 @@ jobs:
           -var="environment=${DEPLOY_ENV}"
           -var="foundation_state_bucket=${FOUNDATION_STATE_BUCKET}"
           -var="foundation_lock_table=${FOUNDATION_LOCK_TABLE}"
-          -var="container_image=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/northstar-demo-${APP_NAME}:${GITHUB_SHA}"
+          -var="container_image=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAME_PREFIX}-${APP_NAME}:${GITHUB_SHA}"
           -out=tfplan
 
       - name: Terraform apply bootstrap
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve tfplan
 
+  aws-build:
+    name: AWS Build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: terraform-bootstrap
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: github-actions-flight-build
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Login to Amazon ECR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push demo image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: demo-app
         env:
           REPOSITORY_URL: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/northstar-demo-flight-management
@@ -96,12 +147,104 @@ jobs:
           docker build -t "${REPOSITORY_URL}:${IMAGE_TAG}" .
           docker push "${REPOSITORY_URL}:${IMAGE_TAG}"
 
+  release-deploy:
+    name: Release Deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: aws-build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: environments/dev
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+      FOUNDATION_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      FOUNDATION_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Allow Terraform module checkout from GitHub
+        run: git config --global url."https://x-access-token:${{ secrets.GH_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: github-actions-flight-release
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+
+      - name: Terraform init
+        run: >
+          terraform init
+          -backend-config="bucket=${TF_STATE_BUCKET}"
+          -backend-config="key=${TF_STATE_KEY}"
+          -backend-config="region=${AWS_REGION}"
+          -backend-config="dynamodb_table=${TF_LOCK_TABLE}"
+
       - name: Terraform apply final image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: >
           terraform apply -auto-approve
           -var="region=${AWS_REGION}"
           -var="environment=${DEPLOY_ENV}"
           -var="foundation_state_bucket=${FOUNDATION_STATE_BUCKET}"
           -var="foundation_lock_table=${FOUNDATION_LOCK_TABLE}"
-          -var="container_image=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/northstar-demo-${APP_NAME}:${GITHUB_SHA}"
+          -var="container_image=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAME_PREFIX}-${APP_NAME}:${GITHUB_SHA}"
+
+  smoke-tests:
+    name: Smoke Tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: release-deploy
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: github-actions-flight-smoke
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for ECS service stability
+        run: aws ecs wait services-stable --cluster "${NAME_PREFIX}-ecs-cluster" --services "${NAME_PREFIX}-${APP_NAME}"
+
+      - name: Fetch ALB DNS from foundation state
+        id: foundation
+        run: |
+          aws s3 cp "s3://${TF_STATE_BUCKET}/${FOUNDATION_STATE_KEY}" foundation.tfstate
+          echo "alb_dns_name=$(jq -r '.outputs.alb_dns_name.value' foundation.tfstate)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test health endpoint
+        run: curl --fail --retry 10 --retry-delay 6 "http://${{ steps.foundation.outputs.alb_dns_name }}${HEALTH_PATH}"
+
+  done:
+    name: Done
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - pre-checks
+      - terraform-bootstrap
+      - aws-build
+      - release-deploy
+      - smoke-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Complete job
+        run: echo "Flight management deployment pipeline completed successfully."
