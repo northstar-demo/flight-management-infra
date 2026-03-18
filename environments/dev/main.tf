@@ -17,7 +17,7 @@ locals {
 }
 
 module "app_service" {
-  source = "git::https://github.com/example-org/shared-terraform-modules.git//modules/app-service?ref=v0.1.0"
+  source = "git::https://github.com/northstar-demo/shared-terraform-modules.git//modules/app-service?ref=v0.1.0"
 
   name_prefix            = var.name_prefix
   app_name               = "flight-management"
